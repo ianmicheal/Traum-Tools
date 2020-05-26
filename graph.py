@@ -260,6 +260,11 @@ class Meshifier(Graph):
 		return strips, tri_indices
 	
 #Generates a collision mesh from a graph
+class Cpoly:
+	def __init__ (self, loop, flags):
+		self.loop = loop
+		self.flags = flags
+
 class Cmesh (Graph):
 	def __init__ (self):
 		super ().__init__ ()
@@ -267,4 +272,30 @@ class Cmesh (Graph):
 	
 	def build (self):
 		super ().build ()
+		
+		#TODO: merge polygons that share the same supporting plane
+		#keep them either as triangles or quads.
+		
+		#Package up the resultant polygons
+		pgons = []
+		for p in self.faces:
+			loop = []
+			
+			#Collect the indices into the loop array
+			edge = p.head
+			while True:
+				loop.append (edge.ndx)
+				
+				edge = edge.next
+				if edge is p.head:
+					break
+			
+			#Canonise the edges by sorting the indices from least to greatest
+			loop.sort ()
+			
+			#Add to the polygon list
+			pgons.append (Cpoly (loop, 0))
+		
+		#Return polygons
+		return pgons
 	

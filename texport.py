@@ -71,27 +71,41 @@ class Export:
 	def __init__ (self, config, context):
 		self.cfg = config
 		self.ctx = context
+	
+	def feedback (self, message):
+		wm = self.ctx.window_manager
 		
+		def draw (self, context):
+			self.layout.label (text = message)
+		
+		wm.popup_menu (draw, title="Traum Tools", icon='INFO')
+	
 	def trace (self, text):
 		if self.cfg.verbose is True:
 			print (text)
 
 	def main (self):
-		from struct import pack
+		from struct import pack, calcsize
 		scene = self.ctx.scene
+		wm = self.ctx.window_manager
 		nmesh = 0
-		ncgs = 0
 		nwg = 0
+		pc = 0
 		
 		writ = {}
 		bin = bytes ()
 		geo = bytes ()
-		cgs = bytes ()
 		wg = bytes ()
 		ents = bytes ()
 		
 		pref = os.path.splitext (self.cfg.filepath)[0]
+		
+		wm.progress_begin (0, len (scene.objects))
 		for o in scene.objects:
+			#Bump the progress bar
+			pc += 1
+			
+			#Ensure the object is a visible mesh
 			if o.type != 'MESH':
 				continue
 			if o.hide_viewport:
@@ -115,9 +129,10 @@ class Export:
 					if 'nowrite' == k:
 						continue
 					edict[k] = o[k]
+					
+				#Add some special keys as well
 				edict['name'] = o.name
 				edict['origin'] = '{0} {1} {2}'.format (o.location[0], o.location[1], o.location[2])
-				
 				#Only used for entities with geometry
 				if not 'nowrite' in keys:
 					edict['mesh'] = id
@@ -137,7 +152,7 @@ class Export:
 					continue
 		
 			#Add object to world graph
-			#TODO: Actually structure this into portals or a tree of some kind
+			#TODO: structure this into a tree
 			
 			#Blender lets users specify different orders of euler angles. 
 			#To make this sane, just convert the world matrix of the object 
@@ -190,6 +205,7 @@ class Export:
 				if key not in mat2poly:
 					mat2poly[key] = []
 				mat2poly[key].append (p)
+				
 
 			#Calculate bounding volume
 			mins = [ math.inf, math.inf, math.inf]
@@ -212,7 +228,8 @@ class Export:
 				centre[i] = extents[i] + mins[i]
 				d[i] = maxs[i] - centre[i]
 			radius = math.sqrt (d[0]*d[0] + d[1]*d[1] + d[2]*d[2])
-			
+	
+	
 			#Digest the polygons
 			verts = pack ('<I3f3f1f',\
 				len (mat2poly.items ()),\
@@ -220,8 +237,11 @@ class Export:
 				centre[0], centre[1], centre[2],\
 				radius)
 
+			#Create a collision mesh to fill in below
 			from . import graph
-			cmesh = graph.Cmesh ()	
+			cmesh = graph.Cmesh ()
+			
+			#Process the polygons
 			for key, polygons in mat2poly.items ():
 				verts += pack ('<I', len (key))
 				verts += key.encode ('utf-8')
@@ -233,11 +253,9 @@ class Export:
 					if p.loop_total != 3:
 						#Degenerate
 						if p.loop_total < 3:
-							self.trace ('{0} has degenerate face!'.format (o.name))
-							continue
+							raise RuntimeError ('{0} has degenerate face!'.format (o.name))
 						#More than 3
-						self.trace ('{0} must have 3 vertices!'.format (o.name))
-						continue
+						raise RuntimeError ('{0} must have 3 vertices!'.format (o.name))
 					
 					#Package everything together
 					points = []
@@ -254,57 +272,68 @@ class Export:
 					#Add to collision graph
 					cmesh.add_polygon (points)
 			
+			#Process the collision mesh
+			cpolys = cmesh.build ()
+			
+			#Pack up vertices
+			cgv = bytes ()
+			for v in mesh.vertices:
+				cgv += pack ('<3f', v.co[0], v.co[1], v.co[2])
+			nverts = len (mesh.vertices)
+			
+			#Gather indices into a single list and pack up the faces
+			indices = []
+			cgf = bytes ()
+			for p in cpolys:
+				start = len (indices)
+				indices += p.loop
+				
+				cgf += pack ('<2H', start, len (p.loop))
+			ncpolys = len (cpolys);
+			
+			#Pack up the indices
+			cgi = bytes ()
+			for i in indices:
+				cgi += pack ('<H', i)
+			nindices = len (indices)
+			
+			#Put the data all together
+			cg = pack ('<3I', nverts, nindices, ncpolys)
+			cg += cgv + cgi + cgf
+		
 			#Append all the data to the image
-			geo += verts
+			geo += pack ('<I', len (verts)) + verts
+			geo += pack ('<I', len (cg)) + cg
 			nmesh += 1
 			
 			#Stash index on the data so shared geometry gets written only once
 			writ[o.data] = nmesh
 			
-			#Build and serialise the graph
-			cmesh.build ()
-			cg = bytes ()
-			for v in mesh.vertices:
-				cg += pack ('<3f', v.co[0], v.co[1], v.co[2])
-			for p in cmesh.faces:
-				points = []
-				#Collocate points
-				n = p.head
-				while True:
-					points.append (n.ndx)
-					n = n.next
-					if n is p.head:
-						break
-				cg += pack ('<4H', points[0], points[1], points[2], 0)		
-			cg = pack ('<HH', len (mesh.vertices), len (cmesh.faces)) + cg
-			
-			#Append to the collision graph
-			cgs += cg
-			ncgs += 1
-			
 			#Done with the mesh data
 			o.to_mesh_clear ()
+			
+			wm.progress_update (nmesh)
+			
+		wm.progress_end ()
 		
 		#Add headers for each section
 		geo = pack ('<I', nmesh) + geo
 		wg = pack ('<I', nwg) + wg
-		cgs = pack ('<I', ncgs) + cgs
 		ents = pack ('<I', len (ents)) + ents
 		#Add the header
-		ofs_verts = 6*4
+		ofs_verts = calcsize ('<5I')
 		ofs_wg = ofs_verts + len (geo)
-		ofs_cg = ofs_wg + len (wg)
-		ofs_ents = ofs_cg + len (cg)
+		ofs_ents = ofs_wg + len (wg)
 		MAGICK = 'SW3R'.encode ('utf-8')
-		VERSION = 0x20200416
+		VERSION = 0x20200526
 		header = MAGICK
-		header += pack ('<IIIII', VERSION, ofs_verts, ofs_wg, ofs_cg, ofs_ents)
-		bin = header + geo + wg + cgs + ents
+		header += pack ('<4I', VERSION, ofs_verts, ofs_wg, ofs_ents)
+		bin = header + geo + wg + ents
 		
 		#Dump everything to disk
 		level_path = bpy.path.ensure_ext (pref, '.level')
 		with open (level_path, 'wb') as f:
 			f.write (bin)
 		
-		self.trace ("Done!!!")
+		self.feedback ("Done!!!")
 		return 0
